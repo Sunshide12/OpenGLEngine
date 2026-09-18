@@ -15,6 +15,13 @@ TEXTURE_UNIT_COUNT = 16
 
 _UNBOUND = -1
 
+# One texture unit is held back and never assigned to a slot. Creating or uploading a
+# texture means binding it, and glBindTexture always acts on whichever unit happens to
+# be active, so without somewhere neutral to do that work a new texture silently evicts
+# whatever was resident on the active unit. The slot table still claimed the evicted
+# texture was there, and the only symptom was text sampling pure black.
+_UNITS_RESERVED_FOR_EDITING = 1
+
 
 class TextureHandler:
     """
@@ -43,9 +50,11 @@ class TextureHandler:
     name_slot_dict = {}  # texture name → slot
     slot_id_list = []  # slot → tex_id
     slot_unit_list = []  # slot → texture unit, or _UNBOUND
-    unit_slot_list = [_UNBOUND] * TEXTURE_UNIT_COUNT  # texture unit → slot, or _UNBOUND
+    unit_slot_list = [_UNBOUND] * (TEXTURE_UNIT_COUNT - _UNITS_RESERVED_FOR_EDITING)  # texture unit → slot, or _UNBOUND
     texture_shader_storage_buffer = 0
     max_texture_units = TEXTURE_UNIT_COUNT
+    assignable_units = TEXTURE_UNIT_COUNT - _UNITS_RESERVED_FOR_EDITING
+    scratch_unit = TEXTURE_UNIT_COUNT - 1
     default_texture_file_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _slot_table_dirty = False
     _use_counter = 0
@@ -63,8 +72,11 @@ class TextureHandler:
                 reported_units = int(glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS))
             except Exception:
                 reported_units = TEXTURE_UNIT_COUNT
-            TextureHandler.max_texture_units = max(1, min(TEXTURE_UNIT_COUNT, reported_units))
-            TextureHandler.unit_slot_list = [_UNBOUND] * TextureHandler.max_texture_units
+            TextureHandler.max_texture_units = max(2, min(TEXTURE_UNIT_COUNT, reported_units))
+            # The last unit is the scratch unit; everything below it can hold a slot.
+            TextureHandler.scratch_unit = TextureHandler.max_texture_units - 1
+            TextureHandler.assignable_units = TextureHandler.max_texture_units - _UNITS_RESERVED_FOR_EDITING
+            TextureHandler.unit_slot_list = [_UNBOUND] * TextureHandler.assignable_units
 
             TextureHandler.texture_shader_storage_buffer = glGenBuffers(1)
             TextureHandler.get_textures("placeholder.png")
@@ -129,6 +141,12 @@ class TextureHandler:
                 return slots
 
     @staticmethod
+    def _activate_editing_unit():
+        """Points glActiveTexture at the scratch unit so that creating or uploading a
+           texture cannot disturb a texture another slot depends on."""
+        glActiveTexture(GL_TEXTURE0 + TextureHandler.scratch_unit)
+
+    @staticmethod
     def create_render_target_texture(key, width: int, height: int, minification_filter=GL_LINEAR,
                                      magnification_filter=GL_LINEAR, wrapping_x_axis=GL_CLAMP_TO_EDGE,
                                      wrapping_y_axis=GL_CLAMP_TO_EDGE):
@@ -140,6 +158,7 @@ class TextureHandler:
         if key in TextureHandler.name_id_dict:
             return TextureHandler.name_slot_dict[key], TextureHandler.name_id_dict[key]
 
+        TextureHandler._activate_editing_unit()
         tex_id = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, tex_id)
         glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width, height)
@@ -156,6 +175,7 @@ class TextureHandler:
     @staticmethod
     def _generate_texture(image_name: str | int, min_filter, mag_filter, wrapping_x_axis, wrapping_y_axis,
                           file_path: str, generate_mipmap: bool):
+        TextureHandler._activate_editing_unit()
         tex_id = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, tex_id)
 
