@@ -299,6 +299,67 @@ void main() {
     vColor = vec4(data.r, data.g, data.b, data.a); // Added this back!
 }
     """
+    ui_rect_shader = """
+#version 430 core
+
+layout(location = 0) in vec3 aPos;
+
+// Field order matches struct.pack_into('<6f2I16f', ...) in
+// MODEn_UI_Module_Rendering_Branch.py exactly: every member here is a plain
+// scalar (float/uint), so std430 packs the struct with no implicit padding
+// (std430, unlike std140, does not round a struct's size up to a vec4) and
+// its 96 bytes line up one-to-one with the Python side.
+struct UIRect {
+    float pos_x, pos_y, width, height;    // 0, 1, 2, 3    UI pixels, bottom-left origin
+    float z, bevel_thickness;             // 4, 5          z rides along for a future depth pass; unused while depth test is off
+    uint tex_slot;                        // 6             0xFFFFFFFF = flat colour, no texture
+    uint flags;                           // 7             bit0 raised, bit1 sunken, bit2 clip-to-parent
+    float face_r, face_g, face_b, face_a; // 8, 9, 10, 11
+    float hi_r, hi_g, hi_b, hi_a;         // 12, 13, 14, 15  highlight-edge colour (top/left on a raised bevel)
+    float sh_r, sh_g, sh_b, sh_a;         // 16, 17, 18, 19  shadow-edge colour (bottom/right on a raised bevel)
+    float u0, v0, uw, vh;                 // 20, 21, 22, 23  UV origin + UV size, same (u, v, uw, vh) convention as the text shader
+};
+
+layout(std430, binding = 3) buffer UIRectBuffer {
+    UIRect rects[];
+};
+
+uniform mat4 ui_perspective; // Orthographic UI projection: glm.ortho(0, width, 0, height)
+uniform int u_buffer_offset;
+
+out vec2 vLocalPx;
+out vec2 vRectSize;
+out float vBevel;
+flat out uint vFlags;
+flat out uint vTexSlot;
+out vec4 vFace;
+out vec4 vHighlight;
+out vec4 vShadow;
+out vec2 vUV;
+
+void main() {
+    uint index = uint(gl_InstanceID) + uint(u_buffer_offset);
+    UIRect r = rects[index];
+
+    vec2 rect_pos = vec2(r.pos_x, r.pos_y);
+    vec2 rect_size = vec2(r.width, r.height);
+    vec2 world_pos = rect_pos + (aPos.xy * rect_size);
+
+    // Depth testing is disabled for the UI pass; stacking order comes from
+    // instance index order instead. r.z rides along in case that ever changes.
+    gl_Position = ui_perspective * vec4(world_pos, r.z * 0.0001, 1.0);
+
+    vLocalPx = aPos.xy * rect_size;
+    vRectSize = rect_size;
+    vBevel = r.bevel_thickness;
+    vFlags = r.flags;
+    vTexSlot = r.tex_slot;
+    vFace = vec4(r.face_r, r.face_g, r.face_b, r.face_a);
+    vHighlight = vec4(r.hi_r, r.hi_g, r.hi_b, r.hi_a);
+    vShadow = vec4(r.sh_r, r.sh_g, r.sh_b, r.sh_a);
+    vUV = vec2(r.u0, r.v0) + (aPos.xy * vec2(r.uw, r.vh));
+}
+    """
     default_3d_rendering = """#version 430 core
 
 // --- ATTRIBUTES ---
@@ -532,6 +593,57 @@ void main() {
     // We keep the color's RGB and fold the MSDF coverage into its alpha,
     // so that blending gives us an antialiased glyph edge.
     FragColor = vec4(vColor.rgb, vColor.a * opacity);
+}
+"""
+
+    ui_rect_shader = """
+#version 430 core
+
+//__TEXTURE_SLOT_SAMPLING__
+
+in vec2 vLocalPx;
+in vec2 vRectSize;
+in float vBevel;
+flat in uint vFlags;
+flat in uint vTexSlot;
+in vec4 vFace;
+in vec4 vHighlight;
+in vec4 vShadow;
+in vec2 vUV;
+
+out vec4 FragColor;
+
+const uint UI_BEVEL_RAISED = 1u;
+const uint UI_BEVEL_SUNKEN = 2u;
+const uint UI_NO_TEXTURE = 0xFFFFFFFFu;
+
+void main() {
+    if (vTexSlot != UI_NO_TEXTURE) {
+        // Textured rects (icons, etc.): sample the slot and tint with the face
+        // colour (pass a white face colour for an untinted icon).
+        FragColor = sample_texture_slot(vTexSlot, vUV) * vFace;
+        return;
+    }
+
+    vec4 result = vFace;
+    bool raised = (vFlags & UI_BEVEL_RAISED) != 0u;
+    bool sunken = (vFlags & UI_BEVEL_SUNKEN) != 0u;
+
+    if ((raised || sunken) && vBevel > 0.0) {
+        bool on_top_or_left = (vLocalPx.x < vBevel) || (vLocalPx.y > vRectSize.y - vBevel);
+        bool on_bottom_or_right = (vLocalPx.x > vRectSize.x - vBevel) || (vLocalPx.y < vBevel);
+
+        if (raised) {
+            if (on_top_or_left) result = vHighlight;
+            else if (on_bottom_or_right) result = vShadow;
+        } else {
+            // Sunken: bevel roles swap, giving the classic "pressed" look.
+            if (on_top_or_left) result = vShadow;
+            else if (on_bottom_or_right) result = vHighlight;
+        }
+    }
+
+    FragColor = result;
 }
 """
 
