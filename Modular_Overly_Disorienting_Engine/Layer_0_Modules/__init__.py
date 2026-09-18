@@ -1,0 +1,10 @@
+from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Settings_Module_Rendering_Branch import *
+from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Object_Register_Module_Rendering_Branch import *
+from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Input_Module_Rendering_Branch import *
+from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Texture_Module_Rendering_Branch import *
+from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Shader_Module_Rendering_Branch import *
+from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Time_Module_Rendering_Branch import *
+from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Entity_Module_Hybrid_Branch import *
+# if StartupSettings.enable_default_setup:
+#     default_startup_settings = StartupSettings()
+#     active_startup_settings = default_startup_settings
