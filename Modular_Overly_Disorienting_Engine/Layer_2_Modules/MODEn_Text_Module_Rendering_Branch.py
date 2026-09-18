@@ -503,6 +503,18 @@ class TextLayer:
         else:
             return len(self.paragraphs)
 
+    def remove_paragraph(self, paragraph):
+        """Clears a paragraph and drops it from the layer.
+
+           Needed by anything that owns text with a shorter life than the layer, such
+           as a UI caption whose widget has just been destroyed: without this the
+           glyphs stay in the buffer and go on drawing after their owner is gone."""
+        if paragraph not in self.paragraphs:
+            return False
+        paragraph.clear()
+        self.paragraphs.remove(paragraph)
+        return True
+
     def _calculate_memory_block_quantity(self):
         return self.reserved_characters//MEMORY_BLOCK_SIZE
 
@@ -633,10 +645,21 @@ class Paragraph:
         self._repack_all()
 
     # ---- sentences --------------------------------------------------------------
-    def add_sentence(self,text:str,font_key=FONT_KEY_DEFAULT,size=0.05,r=1.0,g=1.0,b=1.0,a=1.0,mode=MODE_INSTANT_TEXT,interval_in_seconds=0.05,delay_mode=DELAY_WAIT_FOR_SENTENCE,delay_target=None,return_index_instead_of_object:bool=False):
+    def add_sentence(self,text:str,font_key=FONT_KEY_DEFAULT,size=0.05,r=1.0,g=1.0,b=1.0,a=1.0,mode=MODE_INSTANT_TEXT,interval_in_seconds=0.05,delay_mode=DELAY_WAIT_FOR_SENTENCE,delay_target=None,return_index_instead_of_object:bool=False,continue_previous:bool=True):
         """Adds a sentence to the paragraph. A sentence is a collection of runs
-           A paragraph can house as many sentences as it needs to, but a sentence cannot exist without belonging to a paragraph"""
+           A paragraph can house as many sentences as it needs to, but a sentence cannot exist without belonging to a paragraph
+
+           By default a new sentence carries on from where the previous one stopped,
+           which is what makes a paragraph a paragraph. Every sentence used to start at
+           the paragraph's origin, so two sentences in one paragraph drew on top of each
+           other. Pass continue_previous=False for a sentence you intend to position
+           yourself."""
         new_sentence=Sentence(self)
+        if continue_previous and self._sentences:
+            previous_sentence = self._sentences[-1]
+            end_x, end_y = previous_sentence.get_end_pen()
+            new_sentence.x = previous_sentence.x + end_x
+            new_sentence.y = previous_sentence.y + end_y
         self._unfinished_sentence_indexes.append(len(self._sentences))
         self._sentences.append(new_sentence)
         new_sentence.set_delay(delay_mode,delay_target)
@@ -821,7 +844,7 @@ class Sentence:
        It lays its text out in full as soon as that text arrives, and revealing only
        decides how much of that finished layout has been handed to the paragraph yet."""
     __slots__=["memory_blocks","paragraph","runs","_full_text","_all_glyphs","_revealed_count",
-               "_run_of_character","_local_bounds","_internal_timer",
+               "_run_of_character","_local_bounds","_internal_timer","_end_pen",
                "x","y","z","pitch","yaw","roll",
                "delay_mode","delay_target","delay_achieved","paused","is_position_centre",
                "rotate_sentence_around_paragraph","rotate_letters_around_sentence"]
@@ -836,6 +859,10 @@ class Sentence:
         self._run_of_character=[]
         self._local_bounds=None
         self._internal_timer=0.0
+        # Where the pen finished after laying this sentence out, relative to the
+        # sentence's own origin. The paragraph uses it to start the next sentence
+        # where this one left off instead of on top of it.
+        self._end_pen=(0.0, 0.0)
         self.x=0
         self.y=0
         self.z=0
@@ -1091,10 +1118,17 @@ class Sentence:
     def _lay_out(self):
         text = self._full_text
         if not text:
+            self._end_pen = (0.0, 0.0)
             return []
         run_map = self._run_of_character
         wrap_width = self.paragraph._width
         wrapping_enabled = wrap_width is not None and wrap_width > 0
+        # A sentence that continues another one starts partway along a line, but every
+        # line after the first still belongs to the paragraph's left margin, and the
+        # wrap boundary is still the paragraph's right edge. Both are expressed here in
+        # the sentence's own coordinates, which is what layout works in.
+        line_start_x = -float(self.x)
+        wrap_limit = (wrap_width - float(self.x)) if wrapping_enabled else None
 
         glyphs = []
         pen_x = 0.0
@@ -1115,7 +1149,7 @@ class Sentence:
             if character == '\n':
                 glyphs.append(self._blank_record(offset, reveal_id, word_id, run))
                 reveal_id += 1.0
-                pen_x = 0.0
+                pen_x = line_start_x
                 baseline_y -= self._line_height_of(run)
                 previous_code = None
                 a_word_has_been_placed = False
@@ -1137,10 +1171,10 @@ class Sentence:
             while word_end < total and text[word_end] not in (' ', '\n'):
                 word_end += 1
 
-            if wrapping_enabled and pen_x > 0.0:
+            if wrapping_enabled and pen_x > line_start_x:
                 word_width = self._measure_range(offset, word_end, run_map)
-                if pen_x + word_width > wrap_width:
-                    pen_x = 0.0
+                if pen_x + word_width > wrap_limit:
+                    pen_x = line_start_x
                     baseline_y -= self._line_height_of(run)
                     # The kerning pair that straddled the break no longer applies.
                     previous_code = None
@@ -1160,7 +1194,12 @@ class Sentence:
 
             offset = word_end
 
+        self._end_pen = (pen_x, baseline_y)
         return glyphs
+
+    def get_end_pen(self):
+        """Where the pen stopped, relative to this sentence's origin."""
+        return self._end_pen
 
     def _place_character(self, character, character_offset, run, pen_x, baseline_y, previous_code,
                          reveal_id, word_id):

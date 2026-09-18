@@ -77,9 +77,13 @@ def activate_main_loop(loop_addition=None, max_frames=None, per_frame_callback=N
         if max_frames is not None and frames_drawn >= max_frames:
             break
 
-    # Every window has been closed, so the loop is over and GLFW can let go of the
-    # platform resources it grabbed. This used to sit at module level, which meant
-    # that merely importing the engine tore down GLFW: the only reason anything
-    # worked was that the package __init__ happened to call glfw.init() again
-    # immediately afterwards. Creating a context before the import would break it.
-    glfw.terminate()
+    # GLFW only lets go of its platform resources when the loop ended because every
+    # window closed. Stopping early on max_frames leaves the context alive on purpose,
+    # so the caller can still read the framebuffer back or keep stepping the engine.
+    #
+    # This call used to sit at module level, which meant that merely importing the
+    # engine tore down GLFW: the only reason anything worked was that the package
+    # __init__ happened to call glfw.init() again immediately afterwards. Creating a
+    # context before the import broke it.
+    if not Window.active_windows:
+        glfw.terminate()

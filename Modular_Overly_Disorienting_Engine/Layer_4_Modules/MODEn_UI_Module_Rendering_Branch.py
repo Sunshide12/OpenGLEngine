@@ -109,6 +109,7 @@ Minimal usage
     UIHandler._update(dt)   # ticks widgets (e.g. the taskbar clock) and uploads dirty rects
 """
 
+import ctypes
 import struct
 import time as _time
 from OpenGL.GL import *
@@ -116,7 +117,7 @@ from OpenGL.GL import *
 from Modular_Overly_Disorienting_Engine.Layer_0_Modules import purpose_text, TextureHandler, UniformHelper, USE_OWN
 from Modular_Overly_Disorienting_Engine.Layer_1_Modules.MODEn_Model_Module_Rendering_Branch import Model
 from Modular_Overly_Disorienting_Engine.Layer_2_Modules.MODEn_Text_Module_Rendering_Branch import (
-    TextHandler, TextLayer, MODE_INSTANT_TEXT, DELAY_NONE,
+    TextHandler, TextLayer, MODE_INSTANT_TEXT, DELAY_NONE, FONT_KEY_DEFAULT,
 )
 
 purpose_text("A retro Windows-95-style widget toolkit: bevelled windows, buttons, a taskbar, "
@@ -147,6 +148,13 @@ UI_SHADOW_DEFAULT = (0.5, 0.5, 0.5, 1.0)         # 128,128,128 "3D Shadow"
 UI_TITLEBAR_ACTIVE = (0.0, 0.0, 0.5, 1.0)        # 0,0,128     "Active Title"
 UI_TITLEBAR_TEXT = (1.0, 1.0, 1.0, 1.0)
 
+# Caption defaults. A text size is an em size in the layer's units, and a UI layer is
+# built on an orthographic matrix measured in pixels, so these are pixel sizes. The
+# text module's own default of 0.05 is meant for world-space text and would come out
+# microscopic on a UI layer.
+UI_DEFAULT_FONT_KEY = FONT_KEY_DEFAULT
+UI_DEFAULT_FONT_SIZE = 13.0
+
 TITLE_BAR_HEIGHT = 20.0
 TITLE_BAR_MARGIN = 2.0
 CLOSE_BUTTON_SIZE = 16.0
@@ -171,6 +179,22 @@ def screen_to_ui(screen_x, screen_y, viewport_height):
        convention, and the natural way to describe a Win95-style layout) into
        this module's bottom-left-origin, y-up UI space."""
     return screen_x, viewport_height - screen_y
+
+
+def caption_width(text, font_key=None, size=None):
+    """Measured width of a caption, kerning included."""
+    return TextHandler.measure_text(text, font_key or UI_DEFAULT_FONT_KEY,
+                                    UI_DEFAULT_FONT_SIZE if size is None else size)
+
+
+def caption_baseline(height, font_key=None, size=None):
+    """Baseline that centres a caption's cap height inside a widget of the given
+       height. A sentence's y is its first baseline, not its bottom edge, so this
+       has to come off the font's ascender rather than being a fraction of the
+       widget height."""
+    ascender = TextHandler.get_ascender(font_key or UI_DEFAULT_FONT_KEY,
+                                        UI_DEFAULT_FONT_SIZE if size is None else size)
+    return max(1.0, (height - ascender) * 0.5)
 
 
 def _current_clock_string():
@@ -250,13 +274,36 @@ class UIHandler:
 
     # ---- viewport bookkeeping, for the GLFW-y-flip in the mouse handlers below ----
     @staticmethod
+    def _window_key(window_id):
+        """A dictionary key for a GLFW window.
+
+           The window handle the input module passes along is a ctypes pointer, and
+           those are not hashable, so using one as a dict key raised TypeError the
+           moment a real mouse event arrived. Its address is stable for the window's
+           lifetime and hashes fine."""
+        if window_id is None:
+            return None
+        try:
+            return ctypes.cast(window_id, ctypes.c_void_p).value
+        except (ctypes.ArgumentError, TypeError):
+            try:
+                hash(window_id)
+            except TypeError:
+                return id(window_id)
+            return window_id
+
+    @staticmethod
     def set_viewport_size(width, height, window_id=None):
-        UIHandler._viewport_heights[window_id] = height
+        UIHandler._viewport_heights[UIHandler._window_key(window_id)] = height
+        # Also record it as the fallback, so a handler that is handed a window this
+        # was never called for still gets a sane height instead of zero.
+        UIHandler._viewport_heights.setdefault(None, height)
 
     @staticmethod
     def _height_for(window_id):
-        if window_id in UIHandler._viewport_heights:
-            return UIHandler._viewport_heights[window_id]
+        key = UIHandler._window_key(window_id)
+        if key in UIHandler._viewport_heights:
+            return UIHandler._viewport_heights[key]
         return UIHandler._viewport_heights.get(None, 0)
 
     # ---- hit-testing across every layer ----
@@ -627,12 +674,12 @@ class UILabel(UIWidget):
        the "Text integration" section of the module docstring for the current
        limitation around glyph packing not being finished yet)."""
 
-    def __init__(self, layer, x, y, text="", font_key=None, size=0.05, color=(0.0, 0.0, 0.0, 1.0),
+    def __init__(self, layer, x, y, text="", font_key=None, size=None, color=(0.0, 0.0, 0.0, 1.0),
                  parent=None, z=0.0):
         self._paragraph = None
         self._sentence = None
-        self.font_key = font_key
-        self.size = size
+        self.font_key = font_key if font_key is not None else UI_DEFAULT_FONT_KEY
+        self.size = UI_DEFAULT_FONT_SIZE if size is None else size
         self.color = list(color)
         self.text_layer = layer.text_layer
         super().__init__(layer, x, y, width=0.0, height=0.0, z=z, parent=parent, has_own_rect=False)
@@ -651,11 +698,17 @@ class UILabel(UIWidget):
         if self._paragraph is None:
             return
         try:
-            kwargs = dict(r=self.color[0], g=self.color[1], b=self.color[2], a=self.color[3],
-                          size=self.size, mode=MODE_INSTANT_TEXT, delay_mode=DELAY_NONE)
-            if self.font_key is not None:
-                kwargs["font_key"] = self.font_key
-            self._sentence = self._paragraph.add_sentence(text, **kwargs)
+            # A label owns exactly one sentence, so replacing its text means clearing
+            # the paragraph rather than appending another sentence to it.
+            if self._sentence is not None:
+                self._sentence.set_text(text, font_key=self.font_key, size=self.size,
+                                        r=self.color[0], g=self.color[1], b=self.color[2],
+                                        a=self.color[3], mode=MODE_INSTANT_TEXT)
+            else:
+                self._sentence = self._paragraph.add_sentence(
+                    text, font_key=self.font_key, size=self.size,
+                    r=self.color[0], g=self.color[1], b=self.color[2], a=self.color[3],
+                    mode=MODE_INSTANT_TEXT, delay_mode=DELAY_NONE)
             self._apply_position()
         except Exception as exc:
             # Defensive: the text module is WIP and its call signature may still shift.
@@ -666,17 +719,22 @@ class UILabel(UIWidget):
             return
         ax, ay = self.get_absolute_position()
         try:
-            self._sentence.x = ax
-            self._sentence.y = ay
-            self._sentence.z = self.z
+            # Go through set_position rather than assigning x/y, because the glyphs are
+            # already packed in the GPU buffer with their absolute positions baked in:
+            # writing the attribute alone would move the sentence on the CPU only, and
+            # a dragged window's title would stay behind.
+            self._sentence.set_position(ax, ay, self.z)
         except Exception:
             pass
 
     def _apply_visibility(self):
         if self._sentence is None:
             return
+        target_alpha = self.color[3] if self.is_effectively_visible() else 0.0
         try:
-            self._sentence.a = self.color[3] if self.is_effectively_visible() else 0.0
+            # Same reasoning as the position: alpha lives in the packed struct, so it
+            # has to be set through the call that patches the buffer.
+            self._sentence.set_colour(a=target_alpha)
         except Exception:
             pass
 
@@ -685,6 +743,21 @@ class UILabel(UIWidget):
         # in sync instead.
         self._apply_position()
         self._apply_visibility()
+
+    def destroy(self):
+        """Takes the caption's glyphs down with the widget.
+
+           A label's pixels live in the text layer's buffer, not in a rect, so the base
+           class's rect bookkeeping does not touch them. Without this, closing a window
+           left its title and its buttons' captions painted on the desktop."""
+        if self._paragraph is not None and self.text_layer is not None:
+            try:
+                self.text_layer.remove_paragraph(self._paragraph)
+            except Exception as exc:
+                print(f"UILabel.destroy: could not release the caption's paragraph ({exc})")
+            self._paragraph = None
+            self._sentence = None
+        super().destroy()
 
 
 # --------------------------------------------------------------------------
@@ -704,11 +777,9 @@ class UIButton(UIWidget):
         self._pressed = False
         self.label = None
         if caption:
-            # Best-effort horizontal centring: the text module does not yet expose
-            # glyph-metrics/measurement, so this assumes a rough average glyph width.
-            approx_text_width = len(caption) * size_to_px(0.05)
-            label_x = max(2.0, (width - approx_text_width) * 0.5)
-            self.label = UILabel(layer, label_x, height * 0.3, caption, parent=self, color=text_color)
+            label_x = max(2.0, (width - caption_width(caption)) * 0.5)
+            self.label = UILabel(layer, label_x, caption_baseline(height), caption,
+                                 parent=self, color=text_color)
 
     def on_press(self, x, y):
         super().on_press(x, y)
@@ -726,9 +797,10 @@ class UIButton(UIWidget):
 
 
 def size_to_px(size):
-    """Rough glyph-advance estimate (pixels per character) for the crude caption
-       centring above; a placeholder until the text module exposes real metrics."""
-    return size * 100.0
+    """Kept for compatibility. A text size already is a pixel em size on a UI layer,
+       so this is the identity; use caption_width for anything that needs a real
+       measurement."""
+    return size
 
 
 # --------------------------------------------------------------------------
@@ -779,8 +851,8 @@ class UIWindow(UIWidget):
                                     face=UI_TITLEBAR_ACTIVE, highlight=UI_TITLEBAR_ACTIVE, shadow=UI_TITLEBAR_ACTIVE,
                                     bevel=0.0, bevel_mode=FLAG_BEVEL_NONE)
 
-        self.title_label = UILabel(layer, 4.0, TITLE_BAR_HEIGHT * 0.3, title, parent=self.title_bar,
-                                    color=UI_TITLEBAR_TEXT)
+        self.title_label = UILabel(layer, 4.0, caption_baseline(TITLE_BAR_HEIGHT), title,
+                                    parent=self.title_bar, color=UI_TITLEBAR_TEXT)
 
         close_x = title_bar_width - CLOSE_BUTTON_SIZE - 3.0
         close_y = (TITLE_BAR_HEIGHT - CLOSE_BUTTON_SIZE) * 0.5
@@ -828,8 +900,11 @@ class UITaskbar(UIWidget):
         self.clock_panel = UIWidget(layer, clock_x, 3.0, CLOCK_PANEL_WIDTH, TASKBAR_HEIGHT - 6.0,
                                      parent=self, face=UI_FACE_DEFAULT, highlight=UI_HIGHLIGHT_DEFAULT,
                                      shadow=UI_SHADOW_DEFAULT, bevel=2.0, bevel_mode=FLAG_BEVEL_SUNKEN)
-        self.clock_label = UILabel(layer, 6.0, (TASKBAR_HEIGHT - 6.0) * 0.3, _current_clock_string(),
-                                    parent=self.clock_panel)
+        clock_text = _current_clock_string()
+        self.clock_label = UILabel(layer,
+                                   max(2.0, (CLOCK_PANEL_WIDTH - caption_width(clock_text)) * 0.5),
+                                   caption_baseline(TASKBAR_HEIGHT - 6.0), clock_text,
+                                   parent=self.clock_panel)
 
         self._window_buttons = {}
         self._next_window_button_x = 70.0
@@ -934,7 +1009,8 @@ class UIDesktopIcon(UIWidget):
         self.on_activate = on_activate
         self.selected = False
         self._last_press_time = -1.0
-        self.label = UILabel(layer, 0.0, -14.0, label, parent=self)
+        # Centre the caption under the icon; the label's x is relative to the icon.
+        self.label = UILabel(layer, (size - caption_width(label)) * 0.5, -16.0, label, parent=self)
 
     def set_selected(self, selected):
         self.selected = selected
