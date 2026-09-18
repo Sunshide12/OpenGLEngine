@@ -2,6 +2,7 @@ import glfw
 from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Settings_Module_Rendering_Branch import purpose_text
 purpose_text("Handles time standardization/unification and the creation of timed functions")
 from operator import itemgetter
+import inspect
 
 
 class TimeHandler:
@@ -9,7 +10,6 @@ class TimeHandler:
     _last_frame = 0
     _requests = {}
     _paused_requests = {}
-    @staticmethod
 
     @staticmethod
     def _get_request_info(function_reference):
@@ -28,19 +28,49 @@ class TimeHandler:
                 TimeHandler._update_request(request)
         return TimeHandler.delta_time
     @staticmethod
+    def _invoke_completion_callback(function_reference, delta_time, completion):
+        """Calls a timed-function callback, tolerating callbacks that take no arguments.
+
+        Most callbacks are written as `function_reference(delta_time=..., completion=...)`,
+        but some (e.g. Sentence.signal_delay_completion in the text module) are registered
+        as plain zero-argument callables. This inspects the callable's signature and only
+        passes the keyword arguments it actually accepts; if inspection itself is not
+        possible (e.g. some builtins/C callables), it falls back to trying the call with
+        both keywords first and retrying with no arguments on a TypeError.
+        """
+        try:
+            signature = inspect.signature(function_reference)
+        except (TypeError, ValueError):
+            try:
+                return function_reference(delta_time=delta_time, completion=completion)
+            except TypeError:
+                return function_reference()
+
+        accepts_kwargs_freely = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        kwargs = {}
+        if accepts_kwargs_freely or "delta_time" in signature.parameters:
+            kwargs["delta_time"] = delta_time
+        if accepts_kwargs_freely or "completion" in signature.parameters:
+            kwargs["completion"] = completion
+        return function_reference(**kwargs)
+
+    @staticmethod
     # Calculate progress
     def _update_request(function_reference):
         function_reference,start,duration, clear,constant_calling=TimeHandler._get_request_info(function_reference)
         now = glfw.get_time()
         t = min((now - start) / duration, 1.0)
         if t >= 1.0:
-            function_reference(delta_time=TimeHandler.delta_time,completion=t)
+            TimeHandler._invoke_completion_callback(function_reference, TimeHandler.delta_time, t)
             if clear:
                 if function_reference in TimeHandler._requests:
                     del TimeHandler._requests[function_reference]
         else:
             if constant_calling:
-                function_reference(delta_time=TimeHandler.delta_time,completion=t)
+                TimeHandler._invoke_completion_callback(function_reference, TimeHandler.delta_time, t)
     @staticmethod
     def pause_function(function_reference):
         if function_reference in TimeHandler._requests:

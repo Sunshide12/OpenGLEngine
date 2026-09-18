@@ -40,8 +40,13 @@ def activate_main_loop(loop_addition):
     while Window.active_windows:
 
         glfw.poll_events()
-        TextHandler._update(TimeHandler.delta_time)
+
+        # The clock has to be advanced before anything consumes it. This used to read
+        # TimeHandler.delta_time before _update_dt() had run, so every reveal timer and
+        # every scene update was a frame behind, and on the very first frame they were
+        # handed a delta of zero.
         global_dt=TimeHandler._update_dt()
+        TextHandler._update(global_dt)
         SceneHandler.update_scenes(global_dt)
 
         for window in Window.active_windows[:]:  # shallow copy to allow safe removal
@@ -55,4 +60,10 @@ def activate_main_loop(loop_addition):
 
 
         loop_addition(global_dt)
-glfw.terminate()
+
+    # Every window has been closed, so the loop is over and GLFW can let go of the
+    # platform resources it grabbed. This used to sit at module level, which meant
+    # that merely importing the engine tore down GLFW: the only reason anything
+    # worked was that the package __init__ happened to call glfw.init() again
+    # immediately afterwards. Creating a context before the import would break it.
+    glfw.terminate()

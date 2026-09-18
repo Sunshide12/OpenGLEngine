@@ -1,7 +1,7 @@
 
 from Modular_Overly_Disorienting_Engine.Layer_0_Modules import *
 from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Shader_Module_Rendering_Branch import UniformHelper,TextureHandler
-from Modular_Overly_Disorienting_Engine.Layer_1_Modules.MODEn_Lighting_Module_Rendering_Branch import LightHandler
+from Modular_Overly_Disorienting_Engine.Layer_1_Modules.MODEn_Lighting_Module_Rendering_Branch import LightHandler, Light
 from Modular_Overly_Disorienting_Engine.Layer_1_Modules.MODEn_Model_Module_Rendering_Branch import Model
 from Modular_Overly_Disorienting_Engine.Layer_2_Modules import Renderer, PASS_MAIN, CULLING_NAIVE_FRUSTUM
 import numpy as np
@@ -482,8 +482,15 @@ class Camera:
     def render(self,render_to_output:bool=True):
         self.output._activate_output(render_to_output)
         self._update_frustum_planes()
-        # self._uniform_helper.uniforms_available["numLights"]=LightHandler._update_gpu_data(active_lights_in_view)#TODO use the standard functions
-        #TODO optimize
+        # The frustum planes must be current before culling, since
+        # naive_sphere_frustum_culling() reads camera.frustum_planes.
+        visible_in_view = self._renderer.culling_method(self)
+        active_lights_in_view = [renderable for renderable in visible_in_view if isinstance(renderable, Light)]
+        num_lights = LightHandler._update_gpu_data(active_lights_in_view)
+        self._uniform_helper._set_uniforms(["numLights"], [num_lights])
+        #TODO optimize: Renderer._render() below performs its own culling_method(camera) call,
+        # so the visible set above is computed twice per frame. Left as a known inefficiency
+        # because the renderer module is owned elsewhere and should not be edited here.
         self._renderer._render(self)
 
 
@@ -500,19 +507,16 @@ class Output:
         self.resolution_y=starting_settings.resolution_y
         self.frame_buffer_object = glGenFramebuffers(1)
         glBindFramebuffer(GL_FRAMEBUFFER, self.frame_buffer_object)
-        self.texture, self._texture_id = TextureHandler.get_textures(
-            self.frame_buffer_object,
-            minification_filter=self.resolution_x,  # Width
-            magnification_filter=self.resolution_y,  # Height
-            wrapping_x_axis=GL_LINEAR,  # Force min_filter to LINEAR
-            wrapping_y_axis=GL_LINEAR,  # Force mag_filter to LINEAR
-            generate_mipmap=False,      # Crucial: No mipmaps for RTT
-            return_id_with_slot=True
+        # self.texture is the slot integer (not a raw GL id/handle): "engine testing.py"
+        # feeds it straight into mesh vertex data as a texture index, so it must stay
+        # the slot the bound-texture-unit scheme uses. self._texture_id is the raw GL
+        # texture id, kept around only because glFramebufferTexture2D needs it below.
+        # There is no more bindless "handle"/residency concept, so that attribute is gone.
+        self.texture, self._texture_id = TextureHandler.create_render_target_texture(
+            self.frame_buffer_object, self.resolution_x, self.resolution_y
         )
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self._texture_id, 0)
         self.render_buffer_object=glGenRenderbuffers(1)
-        self.handle=TextureHandler.id_handle_dict[self._texture_id]
-        glMakeTextureHandleResidentARB(self.handle)
         if starting_settings.add_stencil_buffer and starting_settings.add_depth_buffer:
             self.buffer_clear_tags=GL_COLOR_BUFFER_BIT |GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT
             glBindRenderbuffer(GL_RENDERBUFFER, self.render_buffer_object)
@@ -535,6 +539,13 @@ class Output:
             glDeleteRenderbuffers(1, [self.render_buffer_object])
             self.render_buffer_object = None
             self.buffer_clear_tags = GL_COLOR_BUFFER_BIT
+        status = glCheckFramebufferStatus(GL_FRAMEBUFFER)
+        if status != GL_FRAMEBUFFER_COMPLETE:
+            glBindFramebuffer(GL_FRAMEBUFFER, 0)
+            raise RuntimeError(
+                f"Camera output framebuffer (resolution {self.resolution_x}x{self.resolution_y}) "
+                f"is incomplete: glCheckFramebufferStatus returned {status!r}."
+            )
         glBindFramebuffer(GL_FRAMEBUFFER,0)
     def _calculate_perspective_matrix(self,fov_y,resolution_x,resolution_y,near_plane,far_plane,fov_x):
         resolution_aspect=resolution_x/resolution_y

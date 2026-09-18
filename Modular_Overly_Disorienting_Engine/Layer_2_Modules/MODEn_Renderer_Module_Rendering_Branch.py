@@ -1,6 +1,7 @@
 from OpenGL.GL import *
 #TODO add documentation to like everything
 from Modular_Overly_Disorienting_Engine.Layer_0_Modules import purpose_text,CompleteShader,USE_OWN
+from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Texture_Module_Rendering_Branch import TextureHandler
 from Modular_Overly_Disorienting_Engine.Layer_2_Modules.MODEn_Text_Module_Rendering_Branch import TextHandler
 import numpy as np
 purpose_text("Handles the rendering process of the camera. Dictates everything related to what objects each shader sees in what order")
@@ -9,7 +10,20 @@ PASS_EXTRA="extra_shader"
 PASS_POST_PROCESSING="post_processing_shader"
 PASS_TEXT="text_shader"
 PASS_TEXT_UI="text_ui_shader"
-default_types_of_shader_passes=[PASS_MAIN,PASS_EXTRA,PASS_POST_PROCESSING,PASS_TEXT,PASS_TEXT_UI]
+PASS_UI="ui_shader"
+default_types_of_shader_passes=[PASS_MAIN,PASS_EXTRA,PASS_POST_PROCESSING,PASS_TEXT,PASS_TEXT_UI,PASS_UI]
+
+
+def _resolve_ui_handler():
+    """The UI module sits in Layer 4 and this renderer is Layer 2, so importing it
+       at module scope would invert the layer order and deadlock the import graph.
+       Looking it up lazily keeps the UI pass optional: an engine build without the
+       UI module still renders everything else."""
+    try:
+        from Modular_Overly_Disorienting_Engine.Layer_4_Modules.MODEn_UI_Module_Rendering_Branch import UIHandler
+    except Exception:
+        return None
+    return UIHandler
 
 
 def _get_models_and_lights(entities:list):
@@ -53,13 +67,21 @@ class Renderer:
                 pass_type_to_set=self._text_shader_pass
             if type_of_pass==PASS_TEXT_UI:
                 pass_type_to_set = self._text_ui_shader_pass
+            if type_of_pass==PASS_UI:
+                pass_type_to_set = self._ui_shader_pass
         else:
             pass_type_to_set=type_of_pass
         for shader in shaders:
             if shader not in self.shaders:
                 self.shaders[shader] = {
                     "pass type": pass_type_to_set,
-                    "models": {}
+                    "models": {},
+                    # Text and UI passes draw layers rather than models. An empty list
+                    # means "every layer of my kind", which is what the passes used to
+                    # assume; filling it in restricts a shader to specific layers, so a
+                    # world-space text shader and a UI text shader can coexist on one
+                    # camera without each drawing the other's layers.
+                    "layers": []
                 }
                 if index != USE_OWN:
                     self._reorder_shaders(shader, index, swap_instead_of_move)
@@ -81,6 +103,24 @@ class Renderer:
                     group_dict[mesh_key] = []
                 if model not in group_dict[mesh_key]:
                     group_dict[mesh_key].append(model)
+    def _add_layers_to_shader(self, shaders, layers):
+        """Binds specific text or UI layers to a shader, the way _add_models_to_shader
+           binds models. Leave a shader with no layers attached and it falls back to
+           drawing every layer of its kind."""
+        if not isinstance(shaders, list): shaders = [shaders]
+        if not isinstance(layers, list): layers = [layers]
+        for shader in shaders:
+            if shader not in self.shaders:
+                continue
+            attached = self.shaders[shader]["layers"]
+            for layer in layers:
+                if layer not in attached:
+                    attached.append(layer)
+
+    def _layers_for(self, shader, all_layers):
+        attached = self.shaders[shader].get("layers")
+        return attached if attached else all_layers
+
     def _reorder_shaders(self,shader,new_index,swap_instead_of_move:bool): #TODO add index = 0 protection
         if shader in self.shader_order:
             self.shader_order.remove(shader)
@@ -143,37 +183,86 @@ class Renderer:
     def _post_processing_shader_pass(shader,camera,renderables):
         pass
 
-    @staticmethod
-    def _text_shader_pass(shader,camera,renderables):  #TODO add layers as the renderable
+    def _draw_layers(self, shader, camera, layers, storage_buffer, binding_point, supply_camera_uniforms):
+        """The shared body of every layer pass.
+
+           Text and UI layers are drawn the same way: one unit quad, instanced once per
+           packed struct, with the shader reading its per-instance data out of an SSBO at
+           gl_InstanceID + u_buffer_offset. The only differences between the passes are
+           which buffer is bound, which binding point it goes to, and whether the camera
+           gets a say in the matrices."""
+        quad = TextHandler._GLOBAL_TEXT_QUAD
+        if quad is None or not storage_buffer:
+            return
+        quad_vao = quad.get_mesh_instance().mesh.VAO
+        shader.use()
+        for layer in layers:
+            instance_count = layer.get_character_count() if hasattr(layer, "get_character_count") \
+                else layer.get_rect_count()
+            if instance_count <= 0:
+                continue
+
+            # Only 16 textures can be visible to one draw call, so tell the texture
+            # handler which ones this layer actually needs before drawing it.
+            wanted_slots = layer.get_used_texture_slots()
+            if wanted_slots:
+                TextureHandler.ensure_resident(wanted_slots)
+
+            shader.set_uniform(["u_buffer_offset"], [layer.buffer_offset])
+            if supply_camera_uniforms:
+                shader.set_uniform(*camera.get_uniforms(shader.wanted_uniforms))
+            # The layer goes last so that its own orthographic matrix wins over the
+            # camera's perspective one when both supply the same uniform name.
+            shader.set_uniform(*layer.get_uniforms(shader.wanted_uniforms))
+
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding_point, storage_buffer)
+            glBindVertexArray(quad_vao)
+            glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None, instance_count)
+            glBindVertexArray(0)
+
+    def _text_shader_pass(self, shader, camera, renderables):
+        """Text that lives in the world: it sits at real coordinates and is occluded by
+           geometry in front of it."""
+        if not TextHandler.text_layers:
+            return
+        layers = self._layers_for(shader, TextHandler.text_layers)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        for layer in TextHandler.text_layers:
-            layer_char_count = sum(p['char_count'] for p in layer.paragraphs)
-            if layer_char_count > 0:
-                shader.use()
-                shader.set_uniform(["u_buffer_offset"], [layer.buffer_offset])
-                shader.set_uniform(*camera.get_uniforms(shader.wanted_uniforms))
-                shader.set_uniform(*layer.get_uniforms(shader.wanted_uniforms))
-                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, TextHandler.text_shader_storage_buffer)
-                glBindVertexArray(TextHandler._GLOBAL_TEXT_QUAD.get_mesh_instance().mesh.VAO)
-                glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None, layer_char_count)
-                glBindVertexArray(0)
+        # Glyph quads sit in the same plane and overlap along their edges. Writing depth
+        # would let whichever glyph drew first clip its neighbour's antialiased border,
+        # leaving visible seams, so the pass tests depth but does not write it.
+        glDepthMask(GL_FALSE)
+        shader.use()
+        shader.set_uniform(["u_distance_range"], [float(TextHandler.distance_range)])
+        self._draw_layers(shader, camera, layers, TextHandler.text_shader_storage_buffer, 2, True)
+        glDepthMask(GL_TRUE)
 
-    @staticmethod
-    def _text_ui_shader_pass(shader, camera, renderables):
+    def _text_ui_shader_pass(self, shader, camera, renderables):
+        """Text pinned to the screen. Draws on top of everything, so the depth buffer is
+           out of the picture entirely and the layer's own orthographic matrix positions
+           the glyphs in pixels."""
+        if not TextHandler.text_layers:
+            return
+        layers = self._layers_for(shader, TextHandler.text_layers)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glDisable(GL_DEPTH_TEST)
-        for layer in renderables:
+        shader.use()
+        shader.set_uniform(["u_distance_range"], [float(TextHandler.distance_range)])
+        self._draw_layers(shader, camera, layers, TextHandler.text_shader_storage_buffer, 2, False)
+        glEnable(GL_DEPTH_TEST)
 
-            pass
-
-            # shader.use()
-            # shader.set_uniform(["u_buffer_offset"], [layer.buffer_offset])
-            # shader.set_uniform(*camera.get_uniforms(shader.wanted_uniforms))
-            # shader.set_uniform(*layer.get_uniforms(shader.wanted_uniforms))
-            # glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, TextHandler.text_shader_storage_buffer)
-            # glBindVertexArray(TextHandler._GLOBAL_TEXT_QUAD.get_mesh_instance().mesh.VAO)
-            # glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None, layer_char_count)
-            # glBindVertexArray(0)
+    def _ui_shader_pass(self, shader, camera, renderables):
+        """The widget rectangles behind the UI text: panels, window frames, buttons.
+           Runs before the UI text pass so that captions land on top of their widget,
+           which is down to shader ordering on the camera, not to anything here."""
+        ui_handler = _resolve_ui_handler()
+        if ui_handler is None or not getattr(ui_handler, "ui_layers", None):
+            return
+        layers = self._layers_for(shader, ui_handler.ui_layers)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDisable(GL_DEPTH_TEST)
+        self._draw_layers(shader, camera, layers, ui_handler.ui_shader_storage_buffer,
+                          ui_handler.UI_BUFFER_BINDING, False)
         glEnable(GL_DEPTH_TEST)

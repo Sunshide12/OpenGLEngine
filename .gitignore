@@ -1,0 +1,8 @@
+# Python bytecode caches. Several __pycache__ directories were committed to
+# this repo before this .gitignore existed; this does not remove them from
+# version control (that would need an explicit `git rm --cached`), it only
+# stops new bytecode caches from being tracked going forward.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

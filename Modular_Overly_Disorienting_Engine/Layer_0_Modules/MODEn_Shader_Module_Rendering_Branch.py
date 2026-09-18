@@ -1,8 +1,53 @@
 from Modular_Overly_Disorienting_Engine.Layer_0_Modules import purpose_text, TextureHandler
+from Modular_Overly_Disorienting_Engine.Layer_0_Modules.MODEn_Texture_Module_Rendering_Branch import TEXTURE_UNIT_COUNT
 from OpenGL.GL import *
 from pyglm import glm
 import numpy as np
 import re
+
+# Shaders do not get to know which OpenGL texture a mesh wants. They get a slot,
+# and they look that slot up in the table the TextureHandler keeps at binding 0
+# to find out which of the bound texture units currently holds it.
+# The lookup has to be a switch over compile time constants: indexing a sampler
+# array with a value that varies per fragment is not allowed by the GLSL spec,
+# and drivers that accept it anyway do so inconsistently.
+TEXTURE_SAMPLING_TOKEN = "//__TEXTURE_SLOT_SAMPLING__"
+
+
+def _build_texture_sampling_glsl(unit_count: int = TEXTURE_UNIT_COUNT) -> str:
+    sample_cases = "\n".join(
+        f"        case {unit}: return texture(u_textures[{unit}], uv);" for unit in range(unit_count))
+    size_cases = "\n".join(
+        f"        case {unit}: return vec2(textureSize(u_textures[{unit}], 0));" for unit in range(unit_count))
+    return f'''layout(std430, binding = 0) buffer TextureSlotTable {{
+    int slot_to_unit[];
+}};
+
+uniform sampler2D u_textures[{unit_count}];
+
+int unit_of_slot(uint slot) {{
+    if (slot >= uint(slot_to_unit.length())) return -1;
+    return slot_to_unit[slot];
+}}
+
+vec4 sample_texture_slot(uint slot, vec2 uv) {{
+    switch (unit_of_slot(slot)) {{
+{sample_cases}
+    }}
+    // The slot exists but its texture is not bound to any unit right now.
+    // Magenta so that it is obvious on screen instead of silently wrong.
+    return vec4(1.0, 0.0, 1.0, 1.0);
+}}
+
+vec2 texture_slot_size(uint slot) {{
+    switch (unit_of_slot(slot)) {{
+{size_cases}
+    }}
+    return vec2(1.0);
+}}'''
+
+
+TEXTURE_SAMPLING_GLSL = _build_texture_sampling_glsl()
 
 purpose_text(
     "Handles the creation, manipulation and linking of shaders. Also contains the source code for built-in shaders")
@@ -83,18 +128,35 @@ def get_shader_data(shader_code: str, get_only_names=True):
 
 def help_shader(shader_code: str):
     return get_shader_data(shader_code)
+
+
+def _decode_info_log(log) -> str:
+    """PyOpenGL hands back bytes on some versions and str on others, and an empty
+       log comes back as None. Without this the error path itself used to blow up,
+       which hid the actual compiler message."""
+    if log is None:
+        return "(driver returned an empty info log)"
+    if isinstance(log, bytes):
+        return log.decode(errors="replace").strip()
+    return str(log).strip()
+
+
+def _number_source_lines(shader_code: str) -> str:
+    """Numbers the shader source so the line the driver complains about is findable.
+       Built-in shaders are assembled from pieces, so the numbers never match the
+       Python file they came from."""
+    return "\n".join(f"{number:4d} | {line}" for number, line in enumerate(shader_code.splitlines(), start=1))
 class VertexShader:
     #TODO pass window size to this in order to make text perfectly scaling
     # ALSO, MAYBE AGG GLMEMORYBARRIER TO MAKE SURE RENDERING WORKS MID POSITION CHANGE
     world_text_shader = """#version 430 core
-#extension GL_ARB_bindless_texture : require
 
 layout(location = 0) in vec3 aPos;
 
 struct CharData {
     // --- Integers (3 slots / 12 bytes) ---
-    uint h_low;             // 0
-    uint h_high;            // 1
+    uint tex_slot;          // 0  which font atlas this glyph lives in
+    uint reserved_int;      // 1  kept so the struct layout stays 128 bytes
     uint use_center_pivot;  // 2
 
     // --- Floats (29 slots / 116 bytes) ---
@@ -120,7 +182,7 @@ uniform int u_buffer_offset;
 
 out vec2 TexCoords;
 out vec4 vColor;
-flat out uvec2 FontHandle;
+flat out uint FontSlot;
 
 mat3 getRotationMatrix(vec3 degrees) {
     vec3 rad = radians(degrees);
@@ -153,20 +215,19 @@ void main() {
     gl_Position = text_perspective * view_matrix * vec4(final_pos, 1.0);
 
     TexCoords = aPos.xy * vec2(data.uw, data.vh) + vec2(data.u, data.v);
-    FontHandle = uvec2(data.h_low, data.h_high);
+    FontSlot = data.tex_slot;
     vColor = vec4(data.r, data.g, data.b, data.a);
 }
     """
     ui_text_shader = """
 #version 430 core
-#extension GL_ARB_bindless_texture : require
 
 layout(location = 0) in vec3 aPos;
 
 struct CharData {
     // --- Integers (3 slots / 12 bytes) ---
-    uint h_low;             // 0
-    uint h_high;            // 1
+    uint tex_slot;          // 0  which font atlas this glyph lives in
+    uint reserved_int;      // 1  kept so the struct layout stays 128 bytes
     uint use_center_pivot;  // 2
 
     // --- Floats (29 slots / 116 bytes) ---
@@ -191,7 +252,7 @@ uniform int u_buffer_offset;
 
 out vec2 TexCoords;
 out vec4 vColor;
-flat out uvec2 FontHandle;
+flat out uint FontSlot;
 
 mat3 getRotationMatrix(vec3 degrees) {
     vec3 rad = radians(degrees);
@@ -234,11 +295,11 @@ void main() {
 
     // 5. Outputs
     TexCoords = aPos.xy * vec2(data.uw, data.vh) + vec2(data.u, data.v);
-    FontHandle = uvec2(data.h_low, data.h_high);
+    FontSlot = data.tex_slot;
     vColor = vec4(data.r, data.g, data.b, data.a); // Added this back!
 }
     """
-    default_3d_rendering = """#version 460 core
+    default_3d_rendering = """#version 430 core
 
 // --- ATTRIBUTES ---
 layout(location = 0) in vec3 aPos;
@@ -278,7 +339,7 @@ void main() {
     vNormal = normalize(normal_matrix * aNormals);  
 }""" #TODO normals suck ass to manually define, find a way to autocalculate
     fullbright_light_ignore = """
-#version 460 core
+#version 430 core
 
 // --- ATTRIBUTES (Kept identical to avoid Python attribute errors) ---
 layout(location = 0) in vec3 aPos;
@@ -306,8 +367,7 @@ void main() {
 }
 """
     bindless_prot = """
-            #version 460 core
-#extension GL_ARB_bindless_texture : require
+            #version 430 core
 
 // Vertex attributes
 layout(location = 0) in vec3 aPos;       // position
@@ -332,8 +392,7 @@ void main() {
 }
     """
     bindless_test = """
-                #version 460 core
-    #extension GL_ARB_bindless_texture : require
+                #version 430 core
 
     // Vertex attributes
     layout(location = 0) in vec3 aPos;       // position
@@ -430,37 +489,53 @@ void main()
 class FragmentShader:
     text_shader="""
 #version 430 core
-#extension GL_ARB_bindless_texture : require
+
+//__TEXTURE_SLOT_SAMPLING__
 
 in vec2 TexCoords;
 in vec4 vColor; // This comes from your data.r, g, b, a
-flat in uvec2 FontHandle;
+flat in uint FontSlot;
 
 out vec4 FragColor;
+
+// How many atlas pixels the distance field ramps across. It has to match the
+// -pxrange the atlas was generated with, which is 4 for every atlas in this repo.
+// The text pass sets it from the font metadata; the fallback below covers the
+// case where nobody bothered.
+uniform float u_distance_range;
 
 float median(float r, float g, float b) {
     return max(min(r, g), min(max(r, g), b));
 }
 
+// Converts the distance field's atlas-space ramp into screen pixels.
+// The old shader hardcoded this to 2.0, which is only correct at one particular
+// glyph size: everything smaller turned to mush and everything larger got soft
+// edges. Deriving it per fragment keeps a glyph crisp at any size or rotation.
+float screen_px_range() {
+    float range = (u_distance_range > 0.0) ? u_distance_range : 4.0;
+    vec2 unit_range = vec2(range) / texture_slot_size(FontSlot);
+    vec2 screen_texture_size = vec2(1.0) / fwidth(TexCoords);
+    return max(0.5 * dot(unit_range, screen_texture_size), 1.0);
+}
+
 void main() {
-    sampler2D msdf_atlas = sampler2D(FontHandle);
-    vec3 msd = texture(msdf_atlas, TexCoords).rgb;
-    
+    vec3 msd = sample_texture_slot(FontSlot, TexCoords).rgb;
+
     // MSDF shape calculation
     float sd = median(msd.r, msd.g, msd.b);
-    float screenPxRange = 2.0; 
-    float screenPxDistance = screenPxRange * (sd - 0.5);
+    float screenPxDistance = screen_px_range() * (sd - 0.5);
     float opacity = clamp(screenPxDistance + 0.5, 0.0, 1.0);
+    if (opacity <= 0.0) discard;
 
     // Apply the text color!
-    // We multiply the color's RGB by the MSDF opacity, 
-    // and combine the color's Alpha with the MSDF opacity.
+    // We keep the color's RGB and fold the MSDF coverage into its alpha,
+    // so that blending gives us an antialiased glyph edge.
     FragColor = vec4(vColor.rgb, vColor.a * opacity);
 }
 """
 
-    default_3d_rendering = """#version 460 core
-#extension GL_ARB_bindless_texture : require
+    default_3d_rendering = """#version 430 core
 
 struct Light {
     vec4 position_on;     // [x, y, z, on_flag]
@@ -473,7 +548,8 @@ struct Light {
 };
 
 // --- UNIFORMS & SSBOs ---
-layout(std430, binding = 0) buffer TexHandles { uvec2 handles[]; };
+//__TEXTURE_SLOT_SAMPLING__
+
 layout(std430, binding = 1) buffer LightBuffer { Light lights[]; };
 
 uniform int numLights;
@@ -537,11 +613,8 @@ vec3 CalcLight(Light l, vec3 normal, vec3 viewDir, vec3 texColor, vec3 specMap) 
 }
 
 void main() {
-    sampler2D diffuseTex = sampler2D(handles[vTexIndex]);
-    sampler2D specularTex = sampler2D(handles[vSpecIndex]);
-
-    vec3 texColor = texture(diffuseTex, vTexCoord).rgb;
-    vec3 specMap = texture(specularTex, vTexCoord).rgb;
+    vec3 texColor = sample_texture_slot(vTexIndex, vTexCoord).rgb;
+    vec3 specMap = sample_texture_slot(vSpecIndex, vTexCoord).rgb;
     vec3 norm = normalize(vNormal);
     vec3 viewDir = normalize(viewPos - vFragPos);
 
@@ -552,12 +625,10 @@ void main() {
 
     FragColor = vec4(result, 1.0);
 }"""
-    fullbright_light_ignore = """#version 460 core
-#extension GL_ARB_bindless_texture : require
+    fullbright_light_ignore = """#version 430 core
 
 // --- UNIFORMS & SSBOs ---
-// Keeping the texture handle buffer
-layout(std430, binding = 0) buffer TexHandles { uvec2 handles[]; };
+//__TEXTURE_SLOT_SAMPLING__
 
 // --- INPUTS ---
 // Keep all inputs from your existing vertex shader to avoid layout mismatches
@@ -570,55 +641,37 @@ in vec3 vFragPos;
 out vec4 FragColor;
 
 void main() {
-    // 1. Convert the handle to a sampler
-    sampler2D diffuseTex = sampler2D(handles[vTexIndex]);
-
+    // 1. Turn the mesh's texture slot into a sample from whichever unit holds it
     // 2. Sample the FULL color (RGBA)
-    vec4 texColor = texture(diffuseTex, vTexCoord);
+    vec4 texColor = sample_texture_slot(vTexIndex, vTexCoord);
 
     // 3. Output the sampled alpha instead of a hardcoded 1.0
     FragColor = texColor;
 }
 """
 
-    bindless_prot = """
-    #version 460 core
-    #extension GL_ARB_bindless_texture : require
+    bindless_prot = """#version 430 core
 
-    // Removed GL_ARB_gpu_shader_int64 as it is not supported on your hardware
-    flat in uint vTexIndex;
-    in vec2 vTexCoord;
-    out vec4 fragColor;
+//__TEXTURE_SLOT_SAMPLING__
 
-    layout(std430, binding = 0) buffer TexHandles {
-    uvec2 handles[]; 
-};
+flat in uint vTexIndex;
+in vec2 vTexCoord;
+out vec4 fragColor;
 
-    void main() {
+void main() {
+    fragColor = sample_texture_slot(vTexIndex, vTexCoord);
+}"""
+    bindless_test = """#version 430 core
 
-        // The bindless extension allows constructing a sampler directly from a uvec2
-        sampler2D tex = sampler2D(handles[vTexIndex]);
-        fragColor = texture(tex, vTexCoord);
-    }"""
-    bindless_test = """
-        #version 460 core
-        #extension GL_ARB_bindless_texture : require
+//__TEXTURE_SLOT_SAMPLING__
 
-        // Removed GL_ARB_gpu_shader_int64 as it is not supported on your hardware
-        flat in uint vTexIndex;
-        in vec2 vTexCoord;
-        out vec4 fragColor;
+flat in uint vTexIndex;
+in vec2 vTexCoord;
+out vec4 fragColor;
 
-        layout(std430, binding = 0) buffer TexHandles {
-        uvec2 handles[]; 
-    };
-
-        void main() {
-
-            // The bindless extension allows constructing a sampler directly from a uvec2
-            sampler2D tex = sampler2D(handles[vTexIndex]);
-            fragColor = texture(tex, vTexCoord);
-        }"""
+void main() {
+    fragColor = sample_texture_slot(vTexIndex, vTexCoord);
+}"""
     _window_renderer = """
         #version 330 core
 
@@ -733,6 +786,18 @@ void main()
 }"""
 
 
+def _expand_texture_sampling(shader_source_class):
+    """Pastes the slot -> sampler helper into every built-in shader that asked for it.
+       Doing it here instead of inside each source string keeps the shaders readable
+       and means the unit count only has to be decided in one place."""
+    for name, source in list(vars(shader_source_class).items()):
+        if isinstance(source, str) and TEXTURE_SAMPLING_TOKEN in source:
+            setattr(shader_source_class, name, source.replace(TEXTURE_SAMPLING_TOKEN, TEXTURE_SAMPLING_GLSL))
+
+
+_expand_texture_sampling(VertexShader)
+_expand_texture_sampling(FragmentShader)
+
 valid_shader_types = [GL_VERTEX_SHADER, GL_FRAGMENT_SHADER, GL_GEOMETRY_SHADER, GL_TESS_CONTROL_SHADER,
                       GL_TESS_EVALUATION_SHADER, GL_COMPUTE_SHADER, VertexShader, FragmentShader]
 
@@ -750,6 +815,25 @@ class CompleteShader:
         f_data = get_shader_data(f_code)
         self.wanted_uniforms = v_data[1] + f_data[1]
         self._cache_locations()
+        if self.program:
+            self._bind_texture_units()
+
+    def _bind_texture_units(self):
+        """Points the sampler array at texture units 0..N-1, once, right after linking.
+           Nothing has to touch it again afterwards: the slot table the TextureHandler
+           keeps in the SSBO at binding 0 is what decides which unit holds which
+           texture, and that table can change without the shader caring."""
+        glUseProgram(self.program)
+        for unit in range(TEXTURE_UNIT_COUNT):
+            location = glGetUniformLocation(self.program, f"u_textures[{unit}]")
+            if location != -1:
+                glUniform1i(location, unit)
+        # Every atlas in this repo was generated with -pxrange 4. The text pass
+        # overrides this per layer when its fonts say otherwise.
+        distance_range_location = glGetUniformLocation(self.program, "u_distance_range")
+        if distance_range_location != -1:
+            glUniform1f(distance_range_location, 4.0)
+        glUseProgram(0)
 
     def _compile_and_attach_shaders(self, v_code, f_code):
         v_shader = self._compile_shader(v_code, GL_VERTEX_SHADER)
@@ -761,7 +845,7 @@ class CompleteShader:
         glLinkProgram(program)
 
         if not glGetProgramiv(program, GL_LINK_STATUS):
-            raise RuntimeError(f"Linker Error: {glGetProgramInfoLog(program).decode()}")
+            raise RuntimeError(f"Linker Error: {_decode_info_log(glGetProgramInfoLog(program))}")
 
         self.program = program
         glDeleteShader(v_shader)
@@ -772,7 +856,8 @@ class CompleteShader:
         glShaderSource(shader, code)
         glCompileShader(shader)
         if not glGetShaderiv(shader, GL_COMPILE_STATUS):
-            raise RuntimeError(f"Compile Error ({s_type}): {glGetShaderInfoLog(shader).decode()}")
+            raise RuntimeError(f"Compile Error ({s_type}):\n{_decode_info_log(glGetShaderInfoLog(shader))}\n"
+                               f"{_number_source_lines(code)}")
         return shader
 
     def _cache_locations(self):

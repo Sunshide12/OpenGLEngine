@@ -46,6 +46,9 @@ class WindowStartupSettings:
         SCALE_TO_MONITOR,
         CONTEXT_VERSION_MAJOR,
         CONTEXT_VERSION_MINOR,
+        OPENGL_PROFILE,
+        OPENGL_CORE_PROFILE,
+        OPENGL_FORWARD_COMPAT,
     ]
     def __init__(self):
         self.starting_resolution_x = 500
@@ -65,8 +68,16 @@ class WindowStartupSettings:
                                         DEPTH_BITS:24,
                                         VISIBLE:TRUE,
                                         DOUBLEBUFFER:TRUE,
+                                        # The engine's shaders target "#version 430 core", and asking for
+                                        # a higher minor version than a driver supports fails context
+                                        # creation outright (e.g. the Mesa software renderer used for
+                                        # testing tops out at 4.5). 4.3 is the actual requirement.
                                         CONTEXT_VERSION_MAJOR:4,
-                                        CONTEXT_VERSION_MINOR:6,
+                                        CONTEXT_VERSION_MINOR:3,
+                                        # The shaders are core-profile code, so request a core, forward
+                                        # compatible context to match.
+                                        OPENGL_PROFILE:OPENGL_CORE_PROFILE,
+                                        OPENGL_FORWARD_COMPAT:TRUE,
         }
         self._standardized_startup_truth_constants=[
             0<=self.starting_resolution_x,
