@@ -475,6 +475,12 @@ class Camera:
         self._renderer._add_shader(shaders,type_of_pass)
     def add_models_to_shaders(self,shaders:CompleteShader|list,models:Model|list):
         self._renderer._add_models_to_shader(shaders, models)
+    def add_layers_to_shaders(self,shaders:CompleteShader|list,layers):
+        """Restricts a text or UI shader to specific layers, the way models are assigned
+           to shaders. A shader with no layers attached draws every layer of its kind,
+           which is fine until a camera has both world-space text and screen-space UI
+           text: then each shader would draw the other's layers in the wrong projection."""
+        self._renderer._add_layers_to_shader(shaders, layers)
 
     def get_fov(self):
         return self.fov_x,self.fov_y
@@ -488,10 +494,9 @@ class Camera:
         active_lights_in_view = [renderable for renderable in visible_in_view if isinstance(renderable, Light)]
         num_lights = LightHandler._update_gpu_data(active_lights_in_view)
         self._uniform_helper._set_uniforms(["numLights"], [num_lights])
-        #TODO optimize: Renderer._render() below performs its own culling_method(camera) call,
-        # so the visible set above is computed twice per frame. Left as a known inefficiency
-        # because the renderer module is owned elsewhere and should not be edited here.
-        self._renderer._render(self)
+        # The renderer would otherwise repeat the frustum test we just did, so hand it
+        # the result we already have.
+        self._renderer._render(self, visible_in_view)
 
 
 

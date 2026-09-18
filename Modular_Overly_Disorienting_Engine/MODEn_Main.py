@@ -33,10 +33,19 @@ def load_engine(any_window=None):
 
 
 
-def activate_main_loop(loop_addition):
+def activate_main_loop(loop_addition=None, max_frames=None, per_frame_callback=None):
+    """Runs the engine until every window has been closed.
+
+       loop_addition is the per-frame hook and receives the frame's delta time.
+       max_frames stops the loop after that many frames instead of waiting for the
+       windows to close, and per_frame_callback runs after the frame has been drawn
+       and presented. Both exist so the engine can be driven offscreen for a fixed
+       number of frames and have the result read back, which is how it gets tested
+       on a machine with no display."""
 
     glEnable(GL_DEPTH_TEST)
 
+    frames_drawn = 0
     while Window.active_windows:
 
         glfw.poll_events()
@@ -59,7 +68,14 @@ def activate_main_loop(loop_addition):
                 window._rendering_loop()
 
 
-        loop_addition(global_dt)
+        if loop_addition is not None:
+            loop_addition(global_dt)
+
+        frames_drawn += 1
+        if per_frame_callback is not None:
+            per_frame_callback(frames_drawn, global_dt)
+        if max_frames is not None and frames_drawn >= max_frames:
+            break
 
     # Every window has been closed, so the loop is over and GLFW can let go of the
     # platform resources it grabbed. This used to sit at module level, which meant

@@ -33,6 +33,10 @@ def _get_models_and_lights(entities:list):
         lights.extend(entity._lights)
     return models,lights
 def naive_sphere_frustum_culling(camera): #TODO add more performant culling modes
+    # A camera that only draws UI or text layers never needs a scene, so treat the
+    # absence of one as "nothing in the world to cull" instead of an AttributeError.
+    if camera.scene is None:
+        return []
     renderable_entities=camera.scene.get_renderable_entities()
     renderables_in_view=[]
     models,lights=_get_models_and_lights(renderable_entities)
@@ -129,8 +133,14 @@ class Renderer:
             else:
                 self.shader_order.insert(new_index, shader)
                 self._reorder_shaders(shader,len(self.shader_order),False)
-    def _render(self,camera):
-        renderables=self.culling_method(camera)
+    def _render(self,camera,renderables=None):
+        """Draws every shader pass in order.
+
+           The camera already has to cull once per frame to work out how many lights
+           are visible, so it passes that result straight in rather than making us
+           repeat the whole frustum test."""
+        if renderables is None:
+            renderables=self.culling_method(camera)
         for shader in self.shader_order:
             self.shaders[shader]["pass type"](shader,camera,renderables)
     def _set_culling_mode(self,culling_mode):
