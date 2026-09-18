@@ -19,6 +19,7 @@ class Window:
             raise TypeError(f"Expected Settings or WindowSettings, got {type(starting_settings)}")
         starting_settings.is_valid()
         self.clear_color=starting_settings.clear_color
+        self.starting_name_for_errors=starting_settings.starting_name
         self.last_clear_color=None
         self._main_camera=None
         self.depth_buffer_clear_value=1.0
@@ -110,6 +111,10 @@ class Window:
         for camera in self._other_linked_cameras:
             camera.render(True)
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT)
+        if self._main_camera is None:
+            raise RuntimeError(
+                f"The window '{self.starting_name_for_errors}' is being rendered but has no main camera. "
+                f"Call window.set_main_camera(camera) after load_engine().")
         self._main_camera.render(False)
         swap_buffers(self.id)
         # glViewport(0, 0, *self.get_dimensions())

@@ -33,15 +33,29 @@ def load_engine(any_window=None):
 
 
 
-def activate_main_loop(loop_addition):
+def activate_main_loop(loop_addition=None, max_frames=None, per_frame_callback=None):
+    """Runs the engine until every window has been closed.
+
+       loop_addition is the per-frame hook and receives the frame's delta time.
+       max_frames stops the loop after that many frames instead of waiting for the
+       windows to close, and per_frame_callback runs after the frame has been drawn
+       and presented. Both exist so the engine can be driven offscreen for a fixed
+       number of frames and have the result read back, which is how it gets tested
+       on a machine with no display."""
 
     glEnable(GL_DEPTH_TEST)
 
+    frames_drawn = 0
     while Window.active_windows:
 
         glfw.poll_events()
-        TextHandler._update(TimeHandler.delta_time)
+
+        # The clock has to be advanced before anything consumes it. This used to read
+        # TimeHandler.delta_time before _update_dt() had run, so every reveal timer and
+        # every scene update was a frame behind, and on the very first frame they were
+        # handed a delta of zero.
         global_dt=TimeHandler._update_dt()
+        TextHandler._update(global_dt)
         SceneHandler.update_scenes(global_dt)
 
         for window in Window.active_windows[:]:  # shallow copy to allow safe removal
@@ -54,5 +68,22 @@ def activate_main_loop(loop_addition):
                 window._rendering_loop()
 
 
-        loop_addition(global_dt)
-glfw.terminate()
+        if loop_addition is not None:
+            loop_addition(global_dt)
+
+        frames_drawn += 1
+        if per_frame_callback is not None:
+            per_frame_callback(frames_drawn, global_dt)
+        if max_frames is not None and frames_drawn >= max_frames:
+            break
+
+    # GLFW only lets go of its platform resources when the loop ended because every
+    # window closed. Stopping early on max_frames leaves the context alive on purpose,
+    # so the caller can still read the framebuffer back or keep stepping the engine.
+    #
+    # This call used to sit at module level, which meant that merely importing the
+    # engine tore down GLFW: the only reason anything worked was that the package
+    # __init__ happened to call glfw.init() again immediately afterwards. Creating a
+    # context before the import broke it.
+    if not Window.active_windows:
+        glfw.terminate()
